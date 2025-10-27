@@ -19,6 +19,7 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import os
 from datetime import datetime
 import feedparser
+import time
 
 # Initialize Flask application and configure CORS for cross-origin requests
 app = Flask(__name__)
@@ -31,6 +32,44 @@ sentiment_analyzer = SentimentIntensityAnalyzer()
 # To use NewsAPI, set the NEWS_API_KEY environment variable
 NEWS_API_KEY = os.getenv('NEWS_API_KEY', 'your_newsapi_key_here')
 newsapi = NewsApiClient(api_key=NEWS_API_KEY) if NEWS_API_KEY != 'your_newsapi_key_here' else None
+
+def fetch_stock_data_with_retry(symbol, period="6mo", max_retries=3):
+    """
+    Fetch stock data with retry logic to handle API failures.
+    
+    Args:
+        symbol (str): Stock ticker symbol
+        period (str): Time period for historical data
+        max_retries (int): Maximum number of retry attempts
+    
+    Returns:
+        tuple: (stock_object, historical_data, success_flag)
+    """
+    for attempt in range(max_retries):
+        try:
+            print(f"Fetching data for {symbol} (attempt {attempt + 1}/{max_retries})...")
+            stock = yf.Ticker(symbol)
+            
+            # Try to get historical data
+            hist = stock.history(period=period)
+            
+            if not hist.empty:
+                print(f"Successfully fetched {len(hist)} days of data for {symbol}")
+                return stock, hist, True
+            else:
+                print(f"No data returned for {symbol} on attempt {attempt + 1}")
+                
+        except Exception as e:
+            print(f"Error fetching {symbol} on attempt {attempt + 1}: {e}")
+            
+        # Wait before retry (exponential backoff)
+        if attempt < max_retries - 1:
+            wait_time = 2 ** attempt  # 1s, 2s, 4s
+            print(f"Waiting {wait_time} seconds before retry...")
+            time.sleep(wait_time)
+    
+    print(f"Failed to fetch data for {symbol} after {max_retries} attempts")
+    return None, None, False
 
 # Global error handlers to ensure consistent JSON responses
 @app.errorhandler(404)
@@ -485,13 +524,11 @@ def get_stock_data(symbol):
         symbol = symbol.upper()
         print(f"Beginning analysis for {symbol}...")
         
-        # Fetch historical stock data using yfinance
-        # 6 months provides good context for technical analysis
-        stock = yf.Ticker(symbol)
-        hist = stock.history(period="6mo")
+        # Fetch historical stock data using robust retry logic
+        stock, hist, success = fetch_stock_data_with_retry(symbol, period="6mo")
         
         # Validate that we have data for this symbol
-        if hist.empty:
+        if not success or hist is None or hist.empty:
             return jsonify({
                 'error': f'No data found for symbol {symbol}. Please verify the symbol is correct.'
             }), 400
@@ -667,10 +704,10 @@ def get_popular_stocks():
     stocks_data = []
     for symbol, name in POPULAR_STOCKS.items():
         try:
-            stock = yf.Ticker(symbol)
-            hist = stock.history(period="5d")
+            # Use robust fetching with shorter period for popular stocks
+            stock, hist, success = fetch_stock_data_with_retry(symbol, period="5d", max_retries=2)
             
-            if len(hist) > 0:
+            if success and len(hist) > 0:
                 current_price = hist['Close'].iloc[-1]
                 prev_price = hist['Close'].iloc[-2] if len(hist) > 1 else current_price
                 change = current_price - prev_price
@@ -682,6 +719,15 @@ def get_popular_stocks():
                     'price': round(current_price, 2),
                     'change': round(change, 2),
                     'change_pct': round(change_pct, 2)
+                })
+            else:
+                # Add placeholder data if fetch failed
+                stocks_data.append({
+                    'symbol': symbol,
+                    'name': name,
+                    'price': 0.00,
+                    'change': 0.00,
+                    'change_pct': 0.00
                 })
         except Exception as e:
             print(f"Error fetching {symbol}: {e}")
